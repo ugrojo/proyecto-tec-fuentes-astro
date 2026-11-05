@@ -1,7 +1,8 @@
 """The images in samples/ that the pipeline processes, with their per-image calibration.
 
 Two kinds of inputs:
-  - <name>.fits: one image in HDU 1 (Rubin coadd cutouts: nJy pixels, so the AB zero point is 31.4).
+  - <name>.fits: one image in HDU 1 (Rubin coadd cutouts: nJy pixels, so the AB zero point is 31.4),
+    with an optional <name>.weight.fits weight map in HDU 1 (e.g. the injected CCDs of inject.py).
   - <base>.fits.fz: multi-extension mosaic exposure (Subaru Suprime-Cam), one image per CCD in HDUs
     1..N, with an optional <base>.weight.fits.fz holding the matching weight maps. Each CCD is
     processed as its own image named <base>_ccd<DET-ID>, extracted to output/inputs/<name>.fits
@@ -89,10 +90,12 @@ def _extract(hdul, hdu, weight_hdul, path, weight_path):
 def find_images(samples: Path = Path("samples"), inputs: Path = Path("output/inputs")):
     images = []
     for path in sorted(samples.glob("*.fits")):
-        if path.name.startswith("testResults_"):
+        if path.name.startswith("testResults_") or path.name.endswith(".weight.fits"):
             continue
         header = fits.getheader(path, 1)
-        images.append(Image(path.stem, path, 1, None, 0, *_calibration(header), _pixel_scale(header)))
+        weight = path.with_name(f"{path.stem}.weight.fits")
+        images.append(Image(path.stem, path, 1, weight if weight.exists() else None, 1,
+                            *_calibration(header), _pixel_scale(header)))
     for path in sorted(samples.glob("*.fits.fz")):
         if path.name.endswith(".weight.fits.fz"):
             continue

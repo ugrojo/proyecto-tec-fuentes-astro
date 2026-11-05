@@ -12,10 +12,14 @@ Point sources give ~0, resolved sources > 0, features sharper than the PSF < 0. 
 PSFEx model built by config/psf_pipeline.sh, and the classic SExtractor catalog from that pipeline
 is matched in as a reference.
 
-Writes output/<name>_stargal.fits (SE++ catalog + spread_model, spreaderr_model and the
-matched classic SPREAD_MODEL/CLASS_STAR) and output/<name>_stargal.png (diagnostics).
+Also computes CLASS_STAR (class_star.py), MU_MAX / MU_THRESHOLD and a third star/galaxy class from
+MU_MAX vs MAG_AUTO (mu_max.py: mu_class 0 point, 1 extended, -1 undefined).
+
+Writes output/<name>_stargal.fits (SE++ catalog + spread_model, spreaderr_model, class_star, mu_*, and
+the matched classic SPREAD_MODEL/CLASS_STAR/MU_) and output/<name>_stargal.png (diagnostics).
 """
 import argparse
+import time
 from pathlib import Path
 
 import matplotlib
@@ -28,6 +32,7 @@ from astropy.table import Table
 
 from class_star import NeuralNetwork, class_star, isophotal_inputs
 from images import find_images
+from mu_max import mu_max_class, surface_brightness
 
 MATCH_RADIUS_PIX = 1.0
 MAX_WINDOW = 511  # SExtractor subsamples beyond 512 px; such objects are far from point-like anyway
@@ -210,14 +215,6 @@ def extended_class(spread, err):
     return np.where(np.isfinite(spread) & np.isfinite(err), cls, -1)
 
 
-def surface_brightness(value, pixel_scale, zero_point):
-    """SExtractor MU_MAX / MU_THRESHOLD: mag/arcsec^2 of a per-pixel flux; 99 where value <= 0."""
-    value = np.asarray(value, float)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        mu = -2.5 * np.log10(value / pixel_scale**2) + zero_point
-    return np.where(value > 0, mu, 99.0)
-
-
 def match(x1, y1, x2, y2, radius):
     """Index into catalog 2 of the nearest source within radius for each source of 1 (-1 = none)."""
     idx = np.full(len(x1), -1)
@@ -272,6 +269,48 @@ def plot(t: Table, name: str, path: Path):
     plt.close(fig)
 
 
+def measure(t, im, output: Path, psf: PSFExModel, nnw: NeuralNetwork, detect_thresh, jobs=None):
+    """Add spread_model, spreaderr_model, extended_class, class_star and mu_* to the SE++ catalog t of image im.
+
+    Reads the SE++ background, variance and segmentation maps of im from output. Returns the analysis
+    threshold (image units) and the wall-clock seconds of each step, for timing comparisons.
+    """
+    name = im.name
+    image, pixel_scale = im.data(), im.pixel_scale
+    weight = im.weight()
+    good = None if weight is None else weight > 0
+    bkg = fits.getdata(output / f"{name}_bkg.fits")
+    var = fits.getdata(output / f"{name}_var.fits")
+    seconds = {}
+
+    start = time.perf_counter()
+    t["spread_model"], t["spreaderr_model"] = spread_model(image, bkg, var, t, psf, good, jobs=jobs)
+    t["extended_class"] = extended_class(t["spread_model"], t["spreaderr_model"])
+    seconds["spread_model"] = time.perf_counter() - start
+
+    # SExtractor's analysis threshold uses the global background noise, not the local map.
+    thresh = detect_thresh * float(np.sqrt(np.median(var if good is None else var[good])))
+    seg = fits.getdata(output / f"{name}_seg.fits")
+    start = time.perf_counter()
+    data = image - bkg if good is None else np.where(good, image - bkg, -np.inf)
+    peak, iso = isophotal_inputs(data, seg, np.asarray(t["detection_id"]), thresh)
+    seconds["isophotes"] = time.perf_counter() - start
+
+    start = time.perf_counter()
+    t["class_star"] = class_star(peak, iso, thresh, psf.fwhm * pixel_scale, pixel_scale, nnw)
+    seconds["class_star"] = time.perf_counter() - start
+
+    start = time.perf_counter()
+    t["mu_max"] = surface_brightness(peak, pixel_scale, im.zero_point)
+    t["mu_threshold"] = surface_brightness(np.full(len(t), thresh), pixel_scale, im.zero_point)
+    saturated = (np.asarray(t["source_flags"]) & 4) > 0
+    t["mu_locus_offset"], t["mu_class"], mu_locus, mu_scatter = mu_max_class(
+        np.asarray(t["auto_mag"]), t["mu_max"], t["mu_threshold"], detect_thresh, saturated)
+    seconds["mu_max"] = time.perf_counter() - start
+    t.meta.update(MULOCUS=mu_locus, MUSCATT=mu_scatter, DETTHR=detect_thresh)
+    return thresh, seconds
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--samples", type=Path, default=Path("samples"))
@@ -295,23 +334,8 @@ def main():
             continue
 
         t = Table.read(cat_path)
-        image = im.data()
-        pixel_scale = im.pixel_scale
-        weight = im.weight()
-        good = None if weight is None else weight > 0
-        bkg = fits.getdata(args.output / f"{name}_bkg.fits")
-        var = fits.getdata(args.output / f"{name}_var.fits")
         psf = PSFExModel(psf_path)
-
-        t["spread_model"], t["spreaderr_model"] = spread_model(image, bkg, var, t, psf, good, jobs=args.jobs)
-        # SExtractor's analysis threshold uses the global background noise, not the local map.
-        thresh = args.detect_thresh * float(np.sqrt(np.median(var if good is None else var[good])))
-        seg = fits.getdata(args.output / f"{name}_seg.fits")
-        data = image - bkg if good is None else np.where(good, image - bkg, -np.inf)
-        peak, iso = isophotal_inputs(data, seg, np.asarray(t["detection_id"]), thresh)
-        t["class_star"] = class_star(peak, iso, thresh, psf.fwhm * pixel_scale, pixel_scale, nnw)
-        t["mu_max"] = surface_brightness(peak, pixel_scale, im.zero_point)
-        t["mu_threshold"] = surface_brightness(np.full(len(t), thresh), pixel_scale, im.zero_point)
+        thresh, _ = measure(t, im, args.output, psf, nnw, args.detect_thresh, args.jobs)
 
         ref = Table.read(args.output / f"{name}_sex2_cat.fits")
         idx = match(np.asarray(t["pixel_centroid_x"]), np.asarray(t["pixel_centroid_y"]),
@@ -321,7 +345,6 @@ def main():
                          ("CLASS_STAR", "sex2_class_star"), ("MAG_AUTO", "sex2_mag_auto"),
                          ("MU_MAX", "sex2_mu_max"), ("MU_THRESHOLD", "sex2_mu_threshold")]:
             t[dst] = np.where(idx >= 0, np.asarray(ref[src])[idx], np.nan)
-        t["extended_class"] = extended_class(t["spread_model"], t["spreaderr_model"])
         t["sex2_extended_class"] = extended_class(t["sex2_spread_model"], t["sex2_spreaderr_model"])
 
         t.write(args.output / f"{name}_stargal.fits", overwrite=True)
@@ -337,13 +360,17 @@ def main():
         okc = t["sex2_matched"] & np.isfinite(t["class_star"])
         dcs = np.abs(t["class_star"][okc] - t["sex2_class_star"][okc])
         print(f"{name}: class_star vs classic CLASS_STAR |diff| median {np.median(dcs):.3f}, "
-              f"within 0.1 for {np.mean(dcs < 0.1):.1%}; seeing {psf.fwhm * pixel_scale:.3f}\", "
+              f"within 0.1 for {np.mean(dcs < 0.1):.1%}; seeing {psf.fwhm * im.pixel_scale:.3f}\", "
               f"threshold {thresh:.3f} (image units)")
         okm = t["sex2_matched"] & (t["mu_max"] < 99) & (t["sex2_mu_max"] < 99)
         dmu = t["mu_max"][okm] - t["sex2_mu_max"][okm]
         print(f"{name}: mu_max vs classic MU_MAX diff median {np.median(dmu):+.4f}, |diff| < 0.05 for "
               f"{np.mean(np.abs(dmu) < 0.05):.1%}; mu_threshold {t['mu_threshold'][0]:.3f} "
               f"(classic {np.nanmedian(t['sex2_mu_threshold']):.3f}) mag/arcsec^2")
+        mc = np.asarray(t["mu_class"])
+        print(f"{name}: mu_class stellar locus mu_max - mag = {t.meta['MULOCUS']:+.3f} (scatter "
+              f"{t.meta['MUSCATT']:.3f}); {np.sum(mc == 0)} point, {np.sum(mc == 1)} extended, "
+              f"{np.sum(mc == -1)} undefined")
 
 
 if __name__ == "__main__":
